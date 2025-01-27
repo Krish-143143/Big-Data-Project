@@ -1,0 +1,89 @@
+import os
+from airflow import DAG
+from airflow.operators.python_operator import PythonOperator
+from airflow.providers.amazon.aws.transfers.local_to_s3 import LocalFilesystemToS3Operator
+from datetime import datetime, timedelta
+from pyspark.sql import SparkSession
+
+# Define constants
+DATA_DIR = "/tmp/retail_data"
+S3_BUCKET = "your-s3-bucket-name"
+S3_KEY_PREFIX = "retail-data/"
+HIVE_TABLE = "retail.customer_sales"
+AWS_REGION = "us-east-1"
+
+# Function: Data ingestion from sources using Sqoop or Kafka (Mocked for simplicity)
+def ingest_data():
+    os.makedirs(DATA_DIR, exist_ok=True)
+    data = """id,customer,product,quantity,price,timestamp
+    1,John Doe,Laptop,1,1200.50,2025-01-01 10:00:00
+    2,Jane Doe,Smartphone,2,800.00,2025-01-02 11:00:00
+    """
+    with open(f"{DATA_DIR}/sales_data.csv", "w") as f:
+        f.write(data)
+
+# Function: Process data using PySpark
+def process_data():
+    spark = SparkSession.builder \
+        .appName("Retail Data Processing") \
+        .config("spark.sql.warehouse.dir", "/user/hive/warehouse") \
+        .enableHiveSupport() \
+        .getOrCreate()
+
+    # Read data
+    df = spark.read.csv(f"{DATA_DIR}/sales_data.csv", header=True, inferSchema=True)
+
+    # Transformation: Calculate total sales per customer
+    sales_summary = df.groupBy("customer").agg({"quantity": "sum", "price": "sum"})
+
+    # Save to Hive
+    sales_summary.write.mode("overwrite").saveAsTable(HIVE_TABLE)
+
+# Define the Airflow DAG
+def create_dag():
+    default_args = {
+        "owner": "airflow",
+        "depends_on_past": False,
+        "email_on_failure": False,
+        "email_on_retry": False,
+        "retries": 1,
+        "retry_delay": timedelta(minutes=5),
+    }
+
+    dag = DAG(
+        "retail_data_pipeline",
+        default_args=default_args,
+        description="Retail Data Analytics Pipeline",
+        schedule_interval="@daily",
+        start_date=datetime(2025, 1, 1),
+        catchup=False,
+    )
+
+    ingest_task = PythonOperator(
+        task_id="ingest_data",
+        python_callable=ingest_data,
+        dag=dag,
+    )
+
+    process_task = PythonOperator(
+        task_id="process_data",
+        python_callable=process_data,
+        dag=dag,
+    )
+
+    upload_to_s3_task = LocalFilesystemToS3Operator(
+        task_id="upload_to_s3",
+        filename=f"{DATA_DIR}/sales_data.csv",
+        dest_key=f"{S3_KEY_PREFIX}sales_data.csv",
+        dest_bucket_name=S3_BUCKET,
+        aws_conn_id="aws_default",
+        region_name=AWS_REGION,
+        dag=dag,
+    )
+
+    ingest_task >> process_task >> upload_to_s3_task
+
+    return dag
+
+# Register the DAG in Airflow
+globals()["retail_data_pipeline"] = create_dag()
